@@ -1,3 +1,6 @@
+import { isAbsolute } from "node:path";
+
+import { localPathStringSchema } from "../localPath.js";
 import { z } from "zod";
 import {
   desktopViewRequestSchema,
@@ -262,7 +265,7 @@ const inlineEvidenceInputSchema = z.unknown().nonoptional();
 inlineEvidenceInputSchema._zod.processJSONSchema =
   evidenceSchema._zod.processJSONSchema;
 
-/** Unauthenticated inline input or an exact same-session retained reference. */
+/** Unauthenticated inline input, an exact same-session retained reference, or one local Evidence file. */
 export const analysisViewSourceSchema = z.discriminatedUnion("kind", [
   z.strictObject({
     kind: z.literal("retained-evidence"),
@@ -271,6 +274,17 @@ export const analysisViewSourceSchema = z.discriminatedUnion("kind", [
   z.strictObject({
     kind: z.literal("inline"),
     evidence: inlineEvidenceInputSchema,
+  }),
+  z.strictObject({
+    kind: z.literal("evidence-file"),
+    path: localPathStringSchema
+      .refine(isAbsolute, {
+        message:
+          "path must be an absolute local filesystem path (for example /tmp/capture.json or C:\\rea\\capture.json)",
+      })
+      .describe(
+        "Absolute local path of one completed Evidence JSON file. REA reads and authenticates it, then projects it like retained Evidence, so large captures are not charged as inline input.",
+      ),
   }),
 ]);
 

@@ -1,3 +1,6 @@
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
 import {
   analysisViewCaptureFixture,
   analysisViewCaptureEvidence,
@@ -19,6 +22,7 @@ import {
 import {
   inspectAnalysisView,
   inspectAnalysisViewValidated,
+  inspectAnalysisViewWithFiles,
   summarizeRetainedAnalysis,
 } from "./AnalysisViewService.js";
 import type { Evidence } from "../../domain/evidence.js";
@@ -27,6 +31,7 @@ import { err, ok } from "../../domain/result.js";
 import { EvidenceLedger } from "../investigation/EvidenceLedger.js";
 import { WEB_NETWORK_CAPTURE_LIMITS } from "../../domain/webNetworkCapture.js";
 import { isImmutableJsonSnapshot } from "../../domain/immutableJson.js";
+import { createTestTempDirectory } from "../../../tests/fixtures/temporaryDirectory.js";
 
 it.each(["layout", "javascript"])(
   "carries the retained %s source snapshot into repeatable shared views",
@@ -859,4 +864,145 @@ it("admits raw_result and parameters before authenticating a portable capture", 
         error: { _tag: "AnalysisResourceConstraintError", resource: "memory" },
       });
     }
+});
+
+describe("inspectAnalysisViewWithFiles", () => {
+  const view = { kind: "environment-manifest" } as const;
+  const writeEvidenceFile = async (value: unknown): Promise<string> => {
+    const root = await createTestTempDirectory("rea-analysis-view-file-");
+    const path = join(root, "capture.json");
+    await writeFile(path, JSON.stringify(value));
+    return path;
+  };
+
+  it("projects an Evidence file exactly as the same Evidence inline", async () => {
+    const parent = analysisViewCaptureEvidence(
+      environmentManifestCaptureFixture(),
+    );
+    const fromFile = await inspectAnalysisViewWithFiles({
+      source: { kind: "evidence-file", path: await writeEvidenceFile(parent) },
+      view,
+    });
+    const inline = inspectAnalysisView({
+      source: { kind: "inline", evidence: parent },
+      view,
+    });
+    if (!fromFile.ok) throw fromFile.error;
+    if (!inline.ok) throw inline.error;
+    expect(fromFile.value.normalized_result).toEqual(
+      inline.value.normalized_result,
+    );
+    expect(fromFile.value.parameters).toEqual(inline.value.parameters);
+  });
+
+  it("accepts from a file a capture whose response text exceeds the inline budget", async () => {
+    const capture = environmentManifestCaptureFixture();
+    const reported = capture.records[0]!.reported as {
+      response: { content: { text: string } };
+    };
+    // Inline admission charges about 14 bytes per character; this body alone overruns it.
+    reported.response.content.text = "a".repeat(
+      Math.ceil(WEB_NETWORK_CAPTURE_LIMITS.outputBytes / 14) + 1024,
+    );
+    const parent = analysisViewCaptureEvidence(capture);
+    expect(
+      inspectAnalysisView({
+        source: { kind: "inline", evidence: parent },
+        view,
+      }),
+    ).toMatchObject({
+      ok: false,
+      error: { _tag: "AnalysisResourceConstraintError", resource: "memory" },
+    });
+    const fromFile = await inspectAnalysisViewWithFiles({
+      source: { kind: "evidence-file", path: await writeEvidenceFile(parent) },
+      view,
+    });
+    if (!fromFile.ok) throw fromFile.error;
+    expect(fromFile.value.parameters).toMatchObject({
+      parent_evidence_id: parent.evidence_id,
+    });
+  });
+
+  it("refuses a relative path, a missing file and JSON that is not Evidence", async () => {
+    expect(
+      await inspectAnalysisViewWithFiles({
+        source: { kind: "evidence-file", path: "capture.json" },
+        view,
+      }),
+    ).toMatchObject({ ok: false, error: { _tag: "AnalysisInputError" } });
+    const missing = join(
+      await createTestTempDirectory("rea-analysis-view-missing-"),
+      "absent.json",
+    );
+    expect(
+      await inspectAnalysisViewWithFiles({
+        source: { kind: "evidence-file", path: missing },
+        view,
+      }),
+    ).toMatchObject({ ok: false, error: { _tag: "EvidenceFileError" } });
+    const notEvidence = await inspectAnalysisViewWithFiles({
+      source: {
+        kind: "evidence-file",
+        path: await writeEvidenceFile({ hello: 1 }),
+      },
+      view,
+    });
+    expect(notEvidence).toMatchObject({
+      ok: false,
+      error: { _tag: "AnalysisInputError" },
+    });
+  });
+
+  it("returns typed cancellation for a cancelled file request", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const parent = analysisViewCaptureEvidence(
+      environmentManifestCaptureFixture(),
+    );
+    expect(
+      await inspectAnalysisViewWithFiles(
+        {
+          source: {
+            kind: "evidence-file",
+            path: await writeEvidenceFile(parent),
+          },
+          view,
+        },
+        undefined,
+        { signal: controller.signal },
+      ),
+    ).toMatchObject({ ok: false, error: { _tag: "AnalysisCancelledError" } });
+  });
+
+  it("returns typed cancellation when a running file request is aborted", async () => {
+    const controller = new AbortController();
+    const parent = analysisViewCaptureEvidence(
+      environmentManifestCaptureFixture(),
+    );
+    const path = await writeEvidenceFile(parent);
+    const running = inspectAnalysisViewWithFiles(
+      { source: { kind: "evidence-file", path }, view },
+      undefined,
+      { signal: controller.signal },
+    );
+    // Queued before the request yields after its synchronous work, so it is seen even if the read already finished.
+    setImmediate(() => controller.abort());
+    expect(await running).toMatchObject({
+      ok: false,
+      error: { _tag: "AnalysisCancelledError" },
+    });
+  });
+
+  it("leaves file sources to the file-aware entry point", () => {
+    expect(
+      inspectAnalysisView({
+        source: { kind: "evidence-file", path: "/tmp/capture.json" },
+        view,
+      }),
+    ).toMatchObject({
+      ok: false,
+      error: { _tag: "AnalysisCapabilityUnavailableError" },
+    });
+  });
 });
