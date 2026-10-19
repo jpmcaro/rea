@@ -30,6 +30,7 @@ import {
 } from "./ClientRegistrationIdentity.js";
 import {
   clientEvidencePaths,
+  clientRegistrationKey,
   manualRegistrationRemediation,
   supportedClients,
 } from "./SupportedClients.js";
@@ -104,6 +105,8 @@ const registrationSchema = z
   .passthrough();
 
 interface ClientRegistrationReadOptions {
+  /** Explicit caller scope may inspect registrations without installation evidence. */
+  readonly clientIds?: readonly string[];
   readonly platform?: NodeJS.Platform;
   readonly environment?: NodeJS.ProcessEnv;
   readonly resources?: ArtifactResourceScope;
@@ -141,6 +144,24 @@ export const readClientRegistrationInspections = async (
   ): void => {
     inspections.push({ status, activation });
   };
+  // A shared registration group is read and parsed once so both surfaces
+  // observe the identical snapshot even if the file changes between reads.
+  const configurations = new Map<
+    string,
+    ReturnType<typeof readEffectiveClientRegistrationConfiguration>
+  >();
+  const sharedConfiguration = (client: SetupClient) => {
+    const key = clientRegistrationKey(client);
+    let configuration = configurations.get(key);
+    if (configuration === undefined) {
+      configuration = readEffectiveClientRegistrationConfiguration(
+        client,
+        options.resources,
+      );
+      configurations.set(key, configuration);
+    }
+    return configuration;
+  };
   for (const client of supportedClients(
     home,
     options.platform,
@@ -156,18 +177,20 @@ export const readClientRegistrationInspections = async (
       });
       continue;
     }
-    const presence = await clientEvidencePresent(client);
-    if (!presence.ok) {
-      record({
-        client: client.name,
-        config_path: presence.error.path,
-        command: [],
-        state: "invalid",
-        remediation: presence.error.detail,
-      });
-      continue;
+    if (options.clientIds?.includes(client.name) !== true) {
+      const presence = await clientEvidencePresent(client);
+      if (!presence.ok) {
+        record({
+          client: client.name,
+          config_path: presence.error.path,
+          command: [],
+          state: "invalid",
+          remediation: presence.error.detail,
+        });
+        continue;
+      }
+      if (!presence.value) continue;
     }
-    if (!presence.value) continue;
     const manualRemediation = manualRegistrationRemediation(client.name);
     if (client.format === "unsupported") {
       if (manualRemediation !== undefined)
@@ -182,10 +205,7 @@ export const readClientRegistrationInspections = async (
     }
     let selectedConfigPath = client.configPath;
     try {
-      const configuration = await readEffectiveClientRegistrationConfiguration(
-        client,
-        options.resources,
-      );
+      const configuration = await sharedConfiguration(client);
       if (!configuration.ok) {
         if (
           options.resources === undefined &&
