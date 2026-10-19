@@ -24,6 +24,45 @@ export interface GetterQueryJob {
   readonly ancestry: GetterAncestor;
 }
 
+/** Shared precise-work bound for getter values and callable receiver contents. */
+export class SemanticGetterExpansion {
+  #limited = false;
+  #visits = 0;
+  #widening = false;
+
+  constructor(readonly state: JavaScriptSemanticAnalysisState) {}
+
+  get limited(): boolean {
+    return this.#limited;
+  }
+
+  get widening(): boolean {
+    return this.#widening;
+  }
+
+  limit(): void {
+    this.#limited = true;
+  }
+
+  reserveResult(): boolean {
+    if (this.#limited) return false;
+    if (!this.#widening && this.#visits >= SEMANTIC_GETTER_EXPANSION_LIMIT) {
+      this.limit();
+      return false;
+    }
+    this.#visits++;
+    return true;
+  }
+
+  widen(): boolean {
+    if (!this.#limited) return false;
+    this.state.getterResourceLimits.add("getter-expansion");
+    this.#widening = true;
+    this.#limited = false;
+    return true;
+  }
+}
+
 /** References at different receiver allocations must not erase ownership. */
 export class SemanticObjectReferenceSet {
   readonly #nodes = new Map<t.Node, Map<string, Reference>>();
@@ -58,25 +97,19 @@ export class SemanticGetterQuery {
   #references = new SemanticObjectReferenceSet();
   #pending: GetterQueryJob[] = [];
   #current: GetterQueryJob | undefined;
-  #limited = false;
-  #visits = 0;
-  #fallback = false;
+  readonly #expansion: SemanticGetterExpansion;
 
-  constructor(readonly state: JavaScriptSemanticAnalysisState) {}
+  constructor(readonly state: JavaScriptSemanticAnalysisState) {
+    this.#expansion = new SemanticGetterExpansion(state);
+  }
 
   get widening(): boolean {
-    return this.#fallback;
+    return this.#expansion.widening;
   }
 
   /** Charge retained local work and getter jobs to the same precise query. */
   reserveResult(): boolean {
-    if (this.#limited) return false;
-    if (!this.#fallback && this.#visits >= SEMANTIC_GETTER_EXPANSION_LIMIT) {
-      this.#limited = true;
-      return false;
-    }
-    this.#visits++;
-    return true;
+    return this.#expansion.reserveResult();
   }
 
   retain(reference: Reference, escapes = false): void {
@@ -84,7 +117,7 @@ export class SemanticGetterQuery {
     this.#references.add({
       ...reference,
       ...(escapes ? { escapes: true } : {}),
-      ...(this.#fallback && this.#current !== undefined
+      ...(this.widening && this.#current !== undefined
         ? { widenedGetterResult: true }
         : {}),
     });
@@ -122,12 +155,12 @@ export class SemanticGetterQuery {
   }
 
   #grows(invocation: GetterInvocation, path: PropertyPath): boolean {
-    if (this.#fallback) return false;
+    if (this.widening) return false;
     const previous = this.#ancestor(invocation);
     if (previous === undefined || previous.length >= path.length) return false;
     // Pruning by ancestry would make memo results depend on the first caller.
     // Widen growing cycles; identical finite cycles are handled by the memo alone.
-    this.#limited = true;
+    this.#expansion.limit();
     return true;
   }
 
@@ -136,10 +169,9 @@ export class SemanticGetterQuery {
     path: PropertyPath,
     escaped = false,
   ): void {
-    if (this.#limited) return;
-    const escapes =
-      escaped || this.#fallback || this.#current?.escapes === true;
-    const selection = this.#fallback ? [] : path;
+    if (this.#expansion.limited) return;
+    const escapes = escaped || this.widening || this.#current?.escapes === true;
+    const selection = this.widening ? [] : path;
     if (this.#grows(invocation, selection)) return;
     if (this.#known(invocation, selection, escapes)) return;
     this.#pending.push({
@@ -164,7 +196,7 @@ export class SemanticGetterQuery {
     for (const reference of root()) this.retain(reference);
     for (
       let cursor = 0;
-      cursor < this.#pending.length && !this.#limited;
+      cursor < this.#pending.length && !this.#expansion.limited;
       cursor++
     ) {
       const job = this.#pending[cursor];
@@ -180,12 +212,9 @@ export class SemanticGetterQuery {
     expand: (job: GetterQueryJob) => void,
   ): readonly Reference[] {
     this.#collect(root, expand);
-    if (this.#limited) {
-      this.state.getterResourceLimits.add("getter-expansion");
+    if (this.#expansion.widen()) {
       // Escaping each selected getter's result covers every omitted suffix.
       // Canonical empty suffixes make the retry finite in receiver/getter pairs.
-      this.#fallback = true;
-      this.#limited = false;
       this.#memo = new WeakMap();
       this.#references = new SemanticObjectReferenceSet();
       this.#pending = [];

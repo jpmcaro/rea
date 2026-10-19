@@ -77,3 +77,45 @@ new Worker(new URL("./worker.js", import.meta.url));`;
   );
   expect(worker?.specifier).toBe(specifier);
 });
+
+it.each([
+  ["URL", null],
+  ["unrelated", "./worker.js"],
+] as const)(
+  "retains exact effects through a branching alias graph writing %s",
+  (property, specifier) => {
+    const depth = 24;
+    const aliases = Array.from(
+      { length: depth },
+      (_, index) =>
+        `const alias${index + 1}=flag${index}?alias${index}.globalThis:alias${index}.window;`,
+    ).join("\n");
+    const source = `import { Worker } from "node:worker_threads";
+import "./independent.js";
+const alias0=globalThis;
+${aliases}
+alias${depth}.${property}=replacement;
+new Worker(new URL("./worker.js",import.meta.url));
+fetch("https://example.test/independent");`;
+    const result = analyzeJavaScriptStaticSource(source);
+    expect(result.parse_status).toBe("complete");
+    expect(
+      result.references
+        .filter((reference) => reference.kind === "worker")
+        .map((reference) => reference.specifier),
+    ).toEqual([specifier]);
+    expect(result.references).toContainEqual(
+      expect.objectContaining({
+        kind: "static-import",
+        specifier: "./independent.js",
+      }),
+    );
+    expect(result.endpoints).toContainEqual(
+      expect.objectContaining({
+        kind: "network",
+        value: "https://example.test/independent",
+        mechanism: "call:fetch",
+      }),
+    );
+  },
+);

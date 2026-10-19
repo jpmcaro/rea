@@ -130,18 +130,87 @@ type StaticObjectProperty =
   | { readonly status: "missing" | "dynamic" }
   | { readonly status: "explicit"; readonly property: t.ObjectProperty };
 
+const objectPrototypeProperties = new WeakMap<
+  t.ObjectExpression,
+  t.ObjectProperty | null
+>();
+
+/** Only a colon-form, noncomputed __proto__ entry changes a literal's prototype. */
+export const semanticObjectPrototypeProperty = (
+  object: t.ObjectExpression,
+): t.ObjectProperty | undefined => {
+  const cached = objectPrototypeProperties.get(object);
+  if (cached !== undefined) return cached ?? undefined;
+  const property = object.properties.find(
+    (entry): entry is t.ObjectProperty =>
+      t.isObjectProperty(entry) &&
+      !entry.computed &&
+      !entry.shorthand &&
+      semanticStaticPropertyKey(entry.key, false) === "__proto__",
+  );
+  objectPrototypeProperties.set(object, property ?? null);
+  return property;
+};
+
 /** Find the effective explicit property, preserving unresolved overrides. */
-export const staticObjectProperty = (
+const objectAccessorPairs = new WeakMap<
+  t.ObjectMethod,
+  t.ObjectMethod | "absent" | "unknown"
+>();
+const objectAccessorPair = (
+  object: t.ObjectExpression,
+  accessor: t.ObjectMethod,
+  name: string,
+) => {
+  const cached = objectAccessorPairs.get(accessor);
+  if (cached !== undefined) return cached;
+  let result: t.ObjectMethod | "absent" | "unknown" = "absent";
+  for (
+    let index = object.properties.indexOf(accessor) - 1;
+    index >= 0;
+    index -= 1
+  ) {
+    const property = object.properties[index]!;
+    if (property === semanticObjectPrototypeProperty(object)) continue;
+    if (t.isSpreadElement(property)) {
+      result = "unknown";
+      break;
+    }
+    const key = semanticStaticPropertyKey(property.key, property.computed);
+    if (key === null) {
+      result = "unknown";
+      break;
+    }
+    if (key !== name) continue;
+    if (t.isObjectMethod(property) && property.kind === accessor.kind) continue;
+    result =
+      t.isObjectMethod(property) && property.kind !== "method"
+        ? property
+        : "absent";
+    break;
+  }
+  objectAccessorPairs.set(accessor, result);
+  return result;
+};
+
+export const staticObjectOwnProperty = (
   object: t.Node | undefined,
   name: string,
   isNullish?: (node: t.Node) => boolean,
-): StaticObjectProperty => {
+):
+  | { readonly status: "missing" | "dynamic" }
+  | {
+      readonly status: "explicit";
+      readonly property: t.ObjectProperty | t.ObjectMethod;
+      readonly setter?: "present" | "absent" | "unknown";
+      readonly pairedAccessor?: t.ObjectMethod | "absent" | "unknown";
+    } => {
   if (object === undefined) return { status: "missing" };
   if (!t.isObjectExpression(object)) return { status: "dynamic" };
   const lookup = (
     current: t.ObjectExpression,
     depth: number,
-  ): StaticObjectProperty => {
+  ): ReturnType<typeof staticObjectOwnProperty> => {
     for (const property of current.properties.toReversed()) {
       if (t.isSpreadElement(property)) {
         const { node: spread, depth: wrappers } = unwrapJavaScriptExpression(
@@ -171,16 +240,44 @@ export const staticObjectProperty = (
           continue;
         return { status: "dynamic" };
       }
+      if (property === semanticObjectPrototypeProperty(current)) continue;
       const key = semanticStaticPropertyKey(property.key, property.computed);
       if (key === null) return { status: "dynamic" };
       if (key !== name) continue;
-      return t.isObjectProperty(property)
-        ? { status: "explicit", property }
-        : { status: "dynamic" };
+      const pairedAccessor =
+        t.isObjectMethod(property) && property.kind !== "method"
+          ? objectAccessorPair(current, property, name)
+          : undefined;
+      return {
+        status: "explicit",
+        property,
+        ...(t.isObjectMethod(property, { kind: "get" })
+          ? {
+              setter:
+                typeof pairedAccessor === "object"
+                  ? ("present" as const)
+                  : (pairedAccessor ?? "unknown"),
+            }
+          : {}),
+        ...(pairedAccessor === undefined ? {} : { pairedAccessor }),
+      };
     }
     return { status: "missing" };
   };
   return lookup(object, 0);
+};
+
+/** Select an own data entry; methods and accessors have separate value owners. */
+export const staticObjectProperty = (
+  object: t.Node | undefined,
+  name: string,
+  isNullish?: (node: t.Node) => boolean,
+): StaticObjectProperty => {
+  const own = staticObjectOwnProperty(object, name, isNullish);
+  if (own.status !== "explicit") return own;
+  return t.isObjectProperty(own.property)
+    ? { status: "explicit", property: own.property }
+    : { status: "dynamic" };
 };
 
 /** Later properties own a key; an intervening dynamic write leaves it unknown. */

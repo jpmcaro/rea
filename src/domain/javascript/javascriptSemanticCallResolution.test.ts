@@ -1,15 +1,28 @@
 import * as t from "@babel/types";
 import { expect, it, vi } from "vitest";
 
-import { indexJavaScriptBindingsSteps } from "./javascriptSemanticAnalysis.js";
+import {
+  indexJavaScriptBindingsSteps,
+  indexJavaScriptBindingsWithReceiversSteps,
+} from "./javascriptSemanticAnalysis.js";
 import {
   resolveLocalCallables,
   type LocalCallableResolution,
 } from "./javascriptSemanticCallResolution.js";
 import { parseJavaScriptSource } from "./javascriptSourceParser.js";
 import { createSemanticReturnedReferences } from "./javascriptSemanticReturnedReferences.js";
+import { semanticCallableResultCompletion } from "./javascriptSemanticCallableResults.js";
+import {
+  indexJavaScriptAmbientWritesSteps,
+  semanticAmbientOwnSlotFactsReady,
+  semanticAmbientOwnSlotUnchanged,
+} from "./javascriptSemanticAmbientWrites.js";
+import { semanticFreshObjectFactsReady } from "./javascriptModuleInterop.js";
 import { semanticBindingAtRead } from "./javascriptSemanticMutationInitializers.js";
-import { traverseJavaScriptAst } from "./javascriptSemanticTraversal.js";
+import {
+  completeSemanticSteps,
+  traverseJavaScriptAst,
+} from "./javascriptSemanticTraversal.js";
 
 const indexed = (source: string) => {
   const parsed = parseJavaScriptSource(source, "callback.js");
@@ -60,10 +73,11 @@ it("bounds shared partial callback alias expansion by AST size", () => {
       vi.spyOn(scope.bindings, "get"),
     );
     try {
-      expect(
-        createSemanticReturnedReferences(context.state)(last.argument.callee)
-          .references,
-      ).toHaveLength(1);
+      const returned = createSemanticReturnedReferences(context.state)(
+        last.argument.callee,
+      );
+      expect(returned.references).toHaveLength(1);
+      expect(returned.complete).toBe(false);
       return {
         callReads,
         referenceReads: lookups.reduce(
@@ -87,6 +101,13 @@ it.each([
   ["if(flag){cb=fallback;cb();}", true],
   ["if(flag)cb=fallback;cb();", false],
   ["cb ||= fallback;cb();", false],
+  ["cb=fallback;{cb();}", true],
+  ["cb=fallback;if(flag){cb();}", true],
+  ["cb=fallback;while(flag){cb();}", true],
+  ["{cb();}cb=fallback;", false],
+  ["(()=>{cb();})();cb=fallback;", false],
+  ["function use(){cb();}use();cb=fallback;", false],
+  ["class Hold{value=cb()}cb=fallback;", false],
 ] as const)(
   "reports initializer coverage at the read: %s",
   (body, expected) => {
@@ -232,6 +253,70 @@ it("does not memoize alias cycle cuts across entry paths", () => {
       callableIds: [fallback.callableId],
     });
   }
+});
+
+it.each([
+  ["function f(){}", false],
+  ["function f(){return}", false],
+  ["function f(){function nested(){return {}}}", false],
+  ["function f(){return {};return}", true],
+  ["function f(){try{return {}}catch(error){}}", false],
+  ["function f(){try{return {}}catch(error){throw error}}", true],
+  ["function f(){try{return}finally{return {}}}", true],
+  ["function f(){try{return {}}finally{if(flag)return}}", false],
+  ["function f(){do{return {}}while(flag)}", false],
+  ["function f(){while(flag){if(other)return}return {}}", false],
+  ["function f(){switch(flag){default:return {}}}", false],
+  ["function f(){block:{return {}}}", false],
+  ["async function f(){return {}}", false],
+  ["function* f(){return {}}", false],
+  ["(()=>({}));", true],
+  ["(async()=>({}));", false],
+])("bounds direct result completion proof: %s", (source, complete) => {
+  const parsed = parseJavaScriptSource(source, "completion.js");
+  const statement = parsed?.program.body[0];
+  if (statement === undefined) throw new Error("Missing callable fixture");
+  const callable = t.isExpressionStatement(statement)
+    ? statement.expression
+    : statement;
+  expect(semanticCallableResultCompletion(callable).complete).toBe(complete);
+});
+
+it("retains possible results while refreshing completed callee captures", () => {
+  const parsed = parseJavaScriptSource(
+    "const holder={proto(){return {__proto__:null}}};holder.proto();",
+    "completion.js",
+  );
+  if (parsed === null) throw new Error("Expected parsed source");
+  const { bindings: state } = completeSemanticSteps(
+    indexJavaScriptBindingsWithReceiversSteps(parsed.program),
+  );
+  const last = state.program.body.at(-1);
+  if (!t.isExpressionStatement(last) || !t.isCallExpression(last.expression))
+    throw new Error("Expected method invocation");
+  const returned = createSemanticReturnedReferences(state, undefined, {
+    bindingReadMayHaveChanged: () => false,
+    ownSlotUnchanged: (owner, key, read) =>
+      semanticAmbientOwnSlotUnchanged(state, owner, key, read),
+  });
+  const callee = last.expression.callee;
+  const provisional = returned(callee);
+  expect(provisional.complete).toBe(false);
+  expect(provisional.references).toHaveLength(1);
+  const snapshots: { fresh: boolean; complete: boolean }[] = [];
+  completeSemanticSteps(
+    indexJavaScriptAmbientWritesSteps(state.program, state, () => () => {
+      if (semanticAmbientOwnSlotFactsReady(state))
+        snapshots.push({
+          fresh: semanticFreshObjectFactsReady(state),
+          complete: returned(callee).complete,
+        });
+    }),
+  );
+  expect(snapshots.length).toBeGreaterThan(0);
+  for (const snapshot of snapshots)
+    expect(snapshot).toEqual({ fresh: false, complete: true });
+  expect(returned(callee).references).toEqual(provisional.references);
 });
 
 const meshLookups = (writes: number): number => {

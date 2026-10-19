@@ -8,13 +8,17 @@ import {
 
 import {
   semanticStaticPropertyKey,
+  readExactJavaScriptLiteral,
   unwrapJavaScriptExpression,
 } from "./javascriptAstValues.js";
-import type {
-  JavaScriptSemanticBindingState,
-  JavaScriptSemanticAnalysisState,
-  JavaScriptSemanticEffectTiming,
+import {
+  resolveSemanticBindingState,
+  semanticResolutionBlocked,
+  type JavaScriptSemanticBindingState,
+  type JavaScriptSemanticAnalysisState,
+  type JavaScriptSemanticEffectTiming,
 } from "./javascriptSemanticState.js";
+import { javaScriptRuntimeContext } from "./javascriptSourceParser.js";
 
 interface StatementPosition {
   readonly body: readonly t.Statement[];
@@ -25,6 +29,8 @@ interface StatementPosition {
 interface BindingReadPosition {
   readonly position: StatementPosition | null;
   readonly repeating: boolean;
+  /** Enclosing statements in this activation also prove initializer coverage. */
+  readonly outer?: BindingReadPosition;
 }
 
 interface ExpressionSiblings {
@@ -46,6 +52,12 @@ interface ExpressionAncestry {
  * result for as long as its parent map is reachable.
  */
 interface InitializerPositionCache {
+  readonly topLevel: WeakMap<t.Node, StatementPosition | null>;
+  readonly statementIndexes: WeakMap<t.Node, ReadonlyMap<t.Statement, number>>;
+  readonly declaratorIndexes: WeakMap<
+    t.VariableDeclaration,
+    ReadonlyMap<t.VariableDeclarator, number>
+  >;
   readonly direct: WeakMap<t.Node, StatementPosition | null>;
   readonly mutation: WeakMap<t.Node, StatementPosition | null>;
   readonly reference: WeakMap<t.Node, StatementPosition | null>;
@@ -70,6 +82,9 @@ const initializerPositionCache = (
   const cached = initializerPositionCaches.get(parents);
   if (cached !== undefined) return cached;
   const created: InitializerPositionCache = {
+    topLevel: new WeakMap(),
+    statementIndexes: new WeakMap(),
+    declaratorIndexes: new WeakMap(),
     direct: new WeakMap(),
     mutation: new WeakMap(),
     reference: new WeakMap(),
@@ -87,17 +102,36 @@ const statementPosition = (
   declarator?: t.VariableDeclarator,
 ): StatementPosition | null => {
   const parent = parents.get(statement);
-  if (!t.isProgram(parent) && !t.isBlockStatement(parent)) return null;
-  const index = parent.body.indexOf(statement);
-  return index < 0
+  if (
+    !t.isProgram(parent) &&
+    !t.isBlockStatement(parent) &&
+    !t.isStaticBlock(parent)
+  )
+    return null;
+  const cache = initializerPositionCache(parents);
+  let indexes = cache.statementIndexes.get(parent);
+  if (indexes === undefined) {
+    indexes = new Map(parent.body.map((node, index) => [node, index]));
+    cache.statementIndexes.set(parent, indexes);
+  }
+  const index = indexes.get(statement);
+  let declaratorIndex = -1;
+  if (t.isVariableDeclaration(statement) && declarator !== undefined) {
+    let declarations = cache.declaratorIndexes.get(statement);
+    if (declarations === undefined) {
+      declarations = new Map(
+        statement.declarations.map((node, index) => [node, index]),
+      );
+      cache.declaratorIndexes.set(statement, declarations);
+    }
+    declaratorIndex = declarations.get(declarator) ?? -1;
+  }
+  return index === undefined
     ? null
     : {
         body: parent.body,
         index,
-        declaratorIndex:
-          t.isVariableDeclaration(statement) && declarator !== undefined
-            ? statement.declarations.indexOf(declarator)
-            : -1,
+        declaratorIndex,
       };
 };
 
@@ -111,13 +145,52 @@ const positionPrecedes = (
       left.declaratorIndex >= 0 &&
       left.declaratorIndex < right.declaratorIndex));
 
-/** Order effects only in a non-repeating top-level activation. */
-export const semanticTopLevelEffectFollowsCapture = (
-  capture: t.Node,
-  effect: t.Node | undefined,
+/** Direct synchronous calls/constructions run literals in their enclosing
+ * activation. Aliases and mutable helpers require separate identity proof. */
+export const semanticLiteralActivationIsImmediate = (
+  node: t.Function | t.Class,
   parents: WeakMap<t.Node, t.Node>,
 ): boolean => {
-  const position = (node: t.Node | undefined): StatementPosition | null => {
+  if (t.isClassMethod(node, { kind: "constructor" })) {
+    const body = parents.get(node);
+    const owner = body === undefined ? undefined : parents.get(body);
+    return (
+      t.isClassExpression(owner) &&
+      semanticLiteralActivationIsImmediate(owner, parents)
+    );
+  }
+  if (t.isFunctionExpression(node) || t.isArrowFunctionExpression(node)) {
+    if (node.async || (t.isFunctionExpression(node) && node.generator))
+      return false;
+  } else if (!t.isClassExpression(node)) return false;
+  let expression: t.Node = node;
+  let parent = parents.get(expression);
+  while (
+    parent !== undefined &&
+    unwrapJavaScriptExpression(parent).node === expression
+  ) {
+    expression = parent;
+    parent = parents.get(expression);
+  }
+  return t.isClassExpression(node)
+    ? t.isNewExpression(parent) && parent.callee === expression
+    : (t.isCallExpression(parent) ||
+        t.isOptionalCallExpression(parent) ||
+        (t.isFunctionExpression(node) && t.isNewExpression(parent))) &&
+        parent.callee === expression;
+};
+
+/** Positions are valid only in one non-repeating top-level activation. */
+const topLevelEffectPosition = (
+  source: t.Node | undefined,
+  parents: WeakMap<t.Node, t.Node>,
+): StatementPosition | null => {
+  if (source === undefined) return null;
+  const positions = initializerPositionCache(parents).topLevel;
+  const cached = positions.get(source);
+  if (cached !== undefined) return cached;
+  const position = (): StatementPosition | null => {
+    let node: t.Node | undefined = source;
     let selected: StatementPosition | null = null;
     let declarator: t.VariableDeclarator | undefined;
     let child: t.Node | undefined;
@@ -135,8 +208,19 @@ export const semanticTopLevelEffectFollowsCapture = (
     }
     return null;
   };
-  const before = position(capture);
-  const after = position(effect);
+  const selected = position();
+  positions.set(source, selected);
+  return selected;
+};
+
+/** Order effects only in a non-repeating top-level activation. */
+export const semanticTopLevelEffectFollowsCapture = (
+  capture: t.Node,
+  effect: t.Node | undefined,
+  parents: WeakMap<t.Node, t.Node>,
+): boolean => {
+  const before = topLevelEffectPosition(capture, parents);
+  const after = topLevelEffectPosition(effect, parents);
   if (before === null || after === null) return false;
   if (positionPrecedes(before, after)) return true;
   if (
@@ -145,7 +229,9 @@ export const semanticTopLevelEffectFollowsCapture = (
     before.declaratorIndex !== after.declaratorIndex
   )
     return false;
-  return expressionEvaluationOrder(capture, effect, parents) === "before";
+  return (
+    semanticExpressionEvaluationOrder(capture, effect, parents) === "before"
+  );
 };
 
 /** Include expression order when a write operation contains the read site. */
@@ -246,6 +332,261 @@ export const semanticEffectTiming = (
   return "unknown";
 };
 
+/** Index sibling statement order; uncertain positions retain canonical timing.
+ * The caller's timing rule must preserve ordinary top-level statement order.
+ * Active buckets and lazily discarded generations retain O(effects) storage. */
+export const createSemanticPrecedingEffectIndex = <
+  Effect extends { readonly node: t.Node | undefined },
+>(
+  parents: WeakMap<t.Node, t.Node>,
+  followsCapture: (capture: t.Node, effect: t.Node | undefined) => boolean,
+) => {
+  interface Bucket {
+    readonly index: number;
+    readonly effects: Set<Effect>;
+  }
+  const effects = new Map<Effect, Bucket | null>();
+  const unordered = new Set<Effect>();
+  const buckets = new Map<number, Bucket>();
+  const heap: Bucket[] = [];
+  let body: readonly t.Statement[] | undefined;
+  const add = (effect: Effect): void => {
+    if (effects.has(effect)) return;
+    const position = topLevelEffectPosition(effect.node, parents);
+    body ??= position?.body;
+    if (position === null || position.body !== body) {
+      effects.set(effect, null);
+      unordered.add(effect);
+      return;
+    }
+    let bucket = buckets.get(position.index);
+    if (bucket === undefined) {
+      bucket = { index: position.index, effects: new Set() };
+      buckets.set(position.index, bucket);
+      let child = heap.length;
+      heap.push(bucket);
+      while (child > 0) {
+        const parent = (child - 1) >> 1;
+        if (heap[parent]!.index <= bucket.index) break;
+        heap[child] = heap[parent]!;
+        child = parent;
+      }
+      heap[child] = bucket;
+    }
+    bucket.effects.add(effect);
+    effects.set(effect, bucket);
+  };
+  const remove = (effect: Effect): void => {
+    const bucket = effects.get(effect);
+    effects.delete(effect);
+    if (bucket === null) unordered.delete(effect);
+    else if (bucket !== undefined) {
+      bucket.effects.delete(effect);
+      if (bucket.effects.size === 0) buckets.delete(bucket.index);
+    }
+  };
+  const first = (): Bucket | undefined => {
+    // A retired bucket can be recreated at the same statement. Compare bucket
+    // identity so stale entries cannot remove the replacement generation.
+    while (heap[0] !== undefined && buckets.get(heap[0].index) !== heap[0]) {
+      const last = heap.pop()!;
+      if (heap.length === 0) break;
+      let parent = 0;
+      for (;;) {
+        const left = parent * 2 + 1;
+        if (left >= heap.length) break;
+        const right = left + 1;
+        const child =
+          right < heap.length && heap[right]!.index < heap[left]!.index
+            ? right
+            : left;
+        if (heap[child]!.index >= last.index) break;
+        heap[parent] = heap[child]!;
+        parent = child;
+      }
+      heap[parent] = last;
+    }
+    return heap[0];
+  };
+  const mayPrecede = (capture: t.Node): boolean => {
+    const position = topLevelEffectPosition(capture, parents);
+    if (position === null || position.body !== body) {
+      for (const effect of effects.keys())
+        if (!followsCapture(capture, effect.node)) return true;
+      return false;
+    }
+    for (const effect of unordered)
+      if (!followsCapture(capture, effect.node)) return true;
+    const earliest = first();
+    if (earliest === undefined || earliest.index > position.index) return false;
+    if (earliest.index < position.index) return true;
+    // Same-statement captures, nested arguments, and declarator order retain
+    // the canonical timing rule instead of acquiring a second syntax parser.
+    for (const effect of earliest.effects)
+      if (!followsCapture(capture, effect.node)) return true;
+    return false;
+  };
+  return {
+    add,
+    delete: remove,
+    mayPrecede,
+  };
+};
+
+const initialCapturePrefixes = new WeakMap<
+  JavaScriptSemanticAnalysisState,
+  WeakSet<t.Node>
+>();
+
+/** Values selected before the first potentially invoking operation. A call is
+ * included only after its operands; property reads, destructuring, coercions,
+ * control flow and unknown syntax stop the proof. Function bodies stay deferred. */
+const initialCapturePrefix = (
+  state: JavaScriptSemanticAnalysisState,
+): WeakSet<t.Node> => {
+  const cached = initialCapturePrefixes.get(state);
+  if (cached !== undefined) return cached;
+  const completed = new WeakSet<t.Node>();
+  initialCapturePrefixes.set(state, completed);
+  // Module dependencies can reenter exported callables before the body starts.
+  if (state.program.sourceType !== "script") return completed;
+  type Task =
+    | { readonly kind: "visit"; readonly node: t.Node }
+    | { readonly kind: "complete"; readonly node: t.Node; readonly stop?: true }
+    | { readonly kind: "stop" };
+  const pending: Task[] = state.program.body.toReversed().map((node) => ({
+    kind: "visit",
+    node,
+  }));
+  while (pending.length > 0) {
+    const task = pending.pop()!;
+    if (task.kind === "stop") break;
+    if (task.kind === "complete") {
+      completed.add(task.node);
+      if (task.stop === true) break;
+      continue;
+    }
+    const { node } = task;
+    const unwrapped = unwrapJavaScriptExpression(node).node;
+    if (unwrapped !== node) {
+      pending.push(
+        { kind: "complete", node },
+        { kind: "visit", node: unwrapped },
+      );
+      continue;
+    }
+    if (
+      (t.isLiteral(node) &&
+        (!t.isTemplateLiteral(node) || node.expressions.length === 0)) ||
+      t.isFunctionDeclaration(node) ||
+      t.isFunctionExpression(node) ||
+      t.isArrowFunctionExpression(node) ||
+      t.isEmptyStatement(node)
+    ) {
+      completed.add(node);
+      continue;
+    }
+    if (t.isIdentifier(node)) {
+      const local = resolveSemanticBindingState(state, node, node.name);
+      const wrapper =
+        javaScriptRuntimeContext(state.program) === "commonjs" &&
+        [
+          "require",
+          "module",
+          "exports",
+          "__filename",
+          "__dirname",
+          "arguments",
+        ].includes(node.name);
+      if (
+        (local === undefined && !wrapper) ||
+        semanticResolutionBlocked(state, node, node.name)
+      )
+        break;
+      completed.add(node);
+      continue;
+    }
+    if (t.isObjectExpression(node)) {
+      // Allocation and exact primitive keys do not invoke user code. Spreads
+      // and key coercion can, so they cannot extend the initial capture prefix.
+      if (
+        node.properties.some(
+          (property) =>
+            t.isSpreadElement(property) ||
+            (property.computed &&
+              !readExactJavaScriptLiteral(property.key).found) ||
+            ("decorators" in property && property.decorators?.length),
+        )
+      )
+        break;
+      pending.push({ kind: "complete", node });
+      for (const property of node.properties.toReversed())
+        if (t.isObjectProperty(property))
+          pending.push({ kind: "visit", node: property.value });
+      continue;
+    }
+    if (t.isArrayExpression(node)) {
+      if (node.elements.some(t.isSpreadElement)) break;
+      pending.push({ kind: "complete", node });
+      for (const element of node.elements.toReversed())
+        if (element !== null) pending.push({ kind: "visit", node: element });
+      continue;
+    }
+    if (t.isVariableDeclaration(node)) {
+      if (!["var", "let", "const"].includes(node.kind)) break;
+      for (const declaration of node.declarations.toReversed())
+        pending.push({ kind: "visit", node: declaration });
+    } else if (t.isVariableDeclarator(node)) {
+      if (!t.isIdentifier(node.id)) pending.push({ kind: "stop" });
+      if (node.init != null) pending.push({ kind: "visit", node: node.init });
+    } else if (t.isExpressionStatement(node))
+      pending.push({ kind: "visit", node: node.expression });
+    else if (t.isSequenceExpression(node))
+      for (const expression of node.expressions.toReversed())
+        pending.push({ kind: "visit", node: expression });
+    else if (t.isCallExpression(node) || t.isOptionalCallExpression(node)) {
+      pending.push({ kind: "complete", node, stop: true });
+      for (const argument of node.arguments.toReversed())
+        pending.push({ kind: "visit", node: argument });
+      pending.push({ kind: "visit", node: node.callee });
+    } else break;
+  }
+  return completed;
+};
+
+/** Complete capture before any source operation could invoke user code.
+ * This certificate includes operand evaluation, not the effects of a call. */
+export const semanticCapturePrecedesUserCode = (
+  capture: t.Node,
+  state: JavaScriptSemanticAnalysisState,
+): boolean =>
+  !t.isCallExpression(capture) &&
+  !t.isOptionalCallExpression(capture) &&
+  initialCapturePrefix(state).has(capture);
+
+/** Extend ordinary order only for captures before local code can first run.
+ * This does not infer invocation order from a function declaration's position. */
+export const semanticEffectFollowsInitialCapture = (
+  capture: t.Node,
+  effect: t.Node | undefined,
+  state: JavaScriptSemanticAnalysisState,
+): boolean => {
+  if (semanticEffectTiming(capture, effect, state) === "after") return true;
+  let child = effect;
+  while (child !== undefined) {
+    if (t.isDecorator(child)) return false;
+    const parent = state.parentsByNode.get(child);
+    if (
+      t.isFunction(parent) &&
+      (parent.body === child ||
+        parent.params.some((parameter) => parameter === child))
+    )
+      return initialCapturePrefix(state).has(capture);
+    child = parent;
+  }
+  return false;
+};
+
 const semanticEnclosingIteration = (
   node: t.Node,
   state: JavaScriptSemanticAnalysisState,
@@ -316,9 +657,12 @@ const expressionChildIndices = (
   const cached = cache.get(node);
   if (cached !== undefined) return cached;
   const children = ((): readonly (t.Node | null)[] | null => {
+    if (t.isStaticBlock(node)) return node.body;
     if (t.isSequenceExpression(node)) return node.expressions;
-    if (t.isArrayExpression(node)) return node.elements;
-    if (t.isObjectExpression(node)) return node.properties;
+    if (t.isArrayExpression(node) || t.isArrayPattern(node))
+      return node.elements;
+    if (t.isObjectExpression(node) || t.isObjectPattern(node))
+      return node.properties;
     if (t.isObjectProperty(node))
       return node.computed ? [node.key, node.value] : [node.value];
     if (
@@ -352,8 +696,8 @@ const expressionChildIndices = (
   return indices;
 };
 
-/** Unproved ordering stays distinct from proof that a write follows the read. */
-const expressionEvaluationOrder = (
+/** Order children within one evaluation; repeated activations remain caller-owned. */
+export const semanticExpressionEvaluationOrder = (
   earlier: t.Node,
   later: t.Node | undefined,
   parents: WeakMap<t.Node, t.Node>,
@@ -377,6 +721,7 @@ const computeDirectInitializerPosition = (
   node: t.Node,
   parents: WeakMap<t.Node, t.Node>,
 ): StatementPosition | null => {
+  if (t.isClassDeclaration(node)) return statementPosition(node, parents);
   if (
     (t.isAssignmentExpression(node) &&
       t.isIdentifier(unwrapJavaScriptExpression(node.left).node)) ||
@@ -591,10 +936,6 @@ const bindingReadPosition = (
     }
     path.push(current);
     const parent = parents.get(current);
-    if (t.isLoop(parent)) {
-      result = { position: null, repeating: true };
-      break;
-    }
     if (
       parent === undefined ||
       t.isFunction(parent) ||
@@ -609,22 +950,78 @@ const bindingReadPosition = (
     const node = path[index];
     if (node === undefined) continue;
     const parent = parents.get(node);
+    if (t.isLoop(parent) && !result.repeating)
+      result = { ...result, repeating: true };
     let position: StatementPosition | null = null;
     if (t.isVariableDeclarator(parent)) {
       const declaration = parents.get(parent);
       if (t.isVariableDeclaration(declaration))
         position = statementPosition(declaration, parents, parent);
-    } else if (
-      t.isStatement(parent) &&
-      !t.isLoop(parent) &&
-      !t.isFunction(parent)
-    )
+    } else if (t.isStatement(parent) && !t.isFunction(parent))
       position = statementPosition(parent, parents);
     if (position !== null && position !== result.position)
-      result = { ...result, position };
+      result = { position, repeating: result.repeating, outer: result };
     cache.set(node, result);
   }
   return result;
+};
+
+/** A straight-line mutation covers this read within the same activation.
+ * Ordering alone does not prove coverage: skipped branches retain earlier values.
+ */
+export const semanticDefiniteMutationPrecedesRead = (
+  mutation: t.Node,
+  read: t.Node,
+  parents: WeakMap<t.Node, t.Node>,
+): boolean => {
+  if (
+    t.isAssignmentExpression(mutation) &&
+    semanticBranchMayBeSkipped(mutation, mutation.right)
+  )
+    return false;
+  const source = directMutationPosition(mutation, parents);
+  const position = bindingReadPosition(read, parents);
+  if (source === null || position.repeating) return false;
+  for (
+    let context: BindingReadPosition | undefined = position;
+    context !== undefined;
+    context = context.outer
+  ) {
+    const target = context.position;
+    if (
+      target !== null &&
+      (positionPrecedes(source, target) ||
+        (source.body === target.body &&
+          source.index === target.index &&
+          source.declaratorIndex === target.declaratorIndex &&
+          semanticExpressionEvaluationOrder(mutation, read, parents) ===
+            "before"))
+    )
+      return true;
+  }
+  return false;
+};
+
+/** A lexical arrow cannot run before its expression creates it. This proves
+ * initialization coverage only; callers still exclude later writes/escapes. */
+export const semanticMutationPrecedesLexicalRead = (
+  mutation: t.Node,
+  read: t.Node,
+  parents: WeakMap<t.Node, t.Node>,
+): boolean => {
+  if (semanticDefiniteMutationPrecedesRead(mutation, read, parents))
+    return true;
+  let current: t.Node | undefined = read;
+  while (current !== undefined) {
+    if (
+      t.isArrowFunctionExpression(current) &&
+      semanticDefiniteMutationPrecedesRead(mutation, current, parents)
+    )
+      return true;
+    if (t.isFunction(current) && !t.isArrowFunctionExpression(current)) break;
+    current = parents.get(current);
+  }
+  return false;
 };
 
 /** Select a local alias at its read, before any later straight-line reassignment. */
@@ -632,20 +1029,52 @@ type SemanticBindingRead = {
   readonly status: "ordered" | "unresolved";
   /** A retained initializer executes on paths reaching this particular read. */
   readonly hasDefiniteInitializer: boolean;
+  /** Retained sources cover values on successful reads, including lexical TDZ exclusion. */
+  readonly hasCoveredReadValue: boolean;
   /** Unresolved reads retain all possible origins for conservative alias effects. */
   readonly binding: JavaScriptSemanticBindingState;
 };
 
+/** A successful lexical read cannot observe an uninitialized entry value:
+ * its declaration either initialized it or the read throws in the TDZ. */
+const initializerHasNoUndefinedEntry = (
+  node: t.Node,
+  parents: WeakMap<t.Node, t.Node>,
+): boolean => {
+  if (t.isClassDeclaration(node)) return true;
+  const parent = parents.get(node);
+  if (t.isFunctionDeclaration(node))
+    return (
+      t.isProgram(parent) ||
+      (t.isBlockStatement(parent) && t.isFunction(parents.get(parent)))
+    );
+  if (!t.isVariableDeclarator(parent) || parent.init !== node) return false;
+  const declaration = parents.get(parent);
+  return t.isVariableDeclaration(declaration) && declaration.kind !== "var";
+};
+
+/** An optional value proof may remove skipped logical writes. It must describe
+ * the retained initializer's value at the supplied read, including intervening
+ * effects; execution order and competing binding writes remain owned here. */
 export const semanticBindingAtRead = (
   binding: JavaScriptSemanticBindingState,
   read: t.Node,
   parents: WeakMap<t.Node, t.Node>,
+  initializerIsTruthy?: (
+    initializer: JavaScriptSemanticBindingState["initializers"][number],
+    read: t.Node,
+  ) => boolean,
 ): SemanticBindingRead => {
   if (
     binding.initializers.length === 0 &&
     binding.referenceInitializers.length === 0
   )
-    return { status: "ordered", binding, hasDefiniteInitializer: false };
+    return {
+      status: "ordered",
+      binding,
+      hasDefiniteInitializer: false,
+      hasCoveredReadValue: false,
+    };
   const initializer = binding.initializers[0];
   const reference = binding.referenceInitializers[0];
   const origin = initializer ?? reference;
@@ -655,19 +1084,62 @@ export const semanticBindingAtRead = (
         ? null
         : initializerPosition(reference, parents, true)
       : initializerPosition(initializer, parents);
-  const { position, repeating } = bindingReadPosition(read, parents);
+  const readPosition = bindingReadPosition(read, parents);
+  const { position, repeating } = readPosition;
   // Coverage and latest-value selection are independent. A preceding write
   // can cover entry even when another write's order remains unknown.
+  const coversRead = (
+    initializer: JavaScriptSemanticBindingState["initializers"][number],
+    reference = false,
+  ): boolean => {
+    let source = initializerPosition(initializer, parents, reference);
+    if (
+      source === null ||
+      // A parameter default is only a possible reference; incoming arguments
+      // remain unrepresented. Declaration/assignment copies have a real site.
+      (reference && source.index < 0) ||
+      initializerMayRetainEntry(initializer, binding, parents)
+    )
+      return false;
+    while (source !== null) {
+      // A prior enclosing-block initializer covers nested reads, including
+      // loop iterations. Coverage does not establish latest-value order.
+      for (
+        let context: BindingReadPosition | undefined = readPosition;
+        context !== undefined;
+        context = context.outer
+      ) {
+        if (
+          context.position !== null &&
+          positionPrecedes(source, context.position)
+        )
+          return true;
+      }
+      // A completed plain block also covers a later outer read. Branches,
+      // loops, handlers and function bodies have no outer statement position,
+      // so a possibly skipped assignment cannot acquire coverage this way.
+      const statement: t.Statement | undefined = source.body[source.index];
+      const block: t.Node | undefined =
+        statement === undefined ? undefined : parents.get(statement);
+      source = t.isBlockStatement(block)
+        ? statementPosition(block, parents)
+        : null;
+    }
+    return false;
+  };
   const hasDefiniteInitializer =
-    position !== null &&
-    binding.initializers.some((initializer) => {
-      const source = initializerPosition(initializer, parents);
-      return (
-        source !== null &&
-        positionPrecedes(source, position) &&
-        !initializerMayRetainEntry(initializer, binding, parents)
-      );
-    });
+    binding.initializers.some((initializer) => coversRead(initializer)) ||
+    binding.referenceInitializers.some((initializer) =>
+      coversRead(initializer, true),
+    );
+  const hasCoveredReadValue =
+    hasDefiniteInitializer ||
+    binding.initializers.some((initializer) =>
+      initializerHasNoUndefinedEntry(initializer.node, parents),
+    ) ||
+    binding.referenceInitializers.some((initializer) =>
+      initializerHasNoUndefinedEntry(initializer.node, parents),
+    );
   if (
     !repeating &&
     origin !== undefined &&
@@ -680,6 +1152,7 @@ export const semanticBindingAtRead = (
       status: "ordered",
       binding,
       hasDefiniteInitializer,
+      hasCoveredReadValue,
     };
   const uncertainOrder =
     repeating ||
@@ -687,21 +1160,40 @@ export const semanticBindingAtRead = (
     position === null ||
     sourcePosition.body !== position.body;
   if (uncertainOrder)
-    return { status: "unresolved", binding, hasDefiniteInitializer };
-  const selected = selectInitializers(binding, position, read, parents);
+    return {
+      status: "unresolved",
+      binding,
+      hasDefiniteInitializer,
+      hasCoveredReadValue,
+    };
+  const selected = selectInitializers(
+    binding,
+    position,
+    read,
+    parents,
+    initializerIsTruthy,
+  );
   if (selected === undefined)
-    return { status: "unresolved", binding, hasDefiniteInitializer };
+    return {
+      status: "unresolved",
+      binding,
+      hasDefiniteInitializer,
+      hasCoveredReadValue,
+    };
   if (selected.binding === binding)
     return {
       status: "ordered",
       binding,
       hasDefiniteInitializer:
         hasDefiniteInitializer || selected.hasDefiniteInitializer,
+      hasCoveredReadValue:
+        hasCoveredReadValue || selected.hasDefiniteInitializer,
     };
   return {
     status: "ordered",
     hasDefiniteInitializer:
       hasDefiniteInitializer || selected.hasDefiniteInitializer,
+    hasCoveredReadValue: hasCoveredReadValue || selected.hasDefiniteInitializer,
     binding: {
       ...binding,
       ...selected.binding,
@@ -718,6 +1210,7 @@ const selectInitializers = (
   position: StatementPosition | null,
   read: t.Node,
   parents: WeakMap<t.Node, t.Node>,
+  initializerIsTruthy?: Parameters<typeof semanticBindingAtRead>[3],
 ):
   | {
       readonly binding: Pick<
@@ -749,7 +1242,7 @@ const selectInitializers = (
         source.declaratorIndex !== position.declaratorIndex
       )
         return undefined;
-      const order = expressionEvaluationOrder(
+      const order = semanticExpressionEvaluationOrder(
         origin.initializer.node,
         read,
         parents,
@@ -763,6 +1256,7 @@ const selectInitializers = (
     preceding,
     binding,
     parents,
+    initializerIsTruthy,
   );
   // Preserve the owner's identity when selection removes no facts. Consumers
   // can then reuse the binding's dependency-aware provenance memo rather than
@@ -787,6 +1281,19 @@ const selectInitializers = (
   };
 };
 
+const initializerAssignment = (
+  initializer: JavaScriptSemanticBindingState["initializers"][number],
+  parents: WeakMap<t.Node, t.Node>,
+): t.AssignmentExpression | undefined => {
+  const node = initializer.node,
+    parent = parents.get(node);
+  return t.isAssignmentExpression(node)
+    ? node
+    : t.isAssignmentExpression(parent) && parent.right === node
+      ? parent
+      : undefined;
+};
+
 /** Logical writes may keep prior aliases. An RHS fact alone does not prove an
  * empty local: the complete binding must exclude incoming/default/other writes.
  */
@@ -795,20 +1302,14 @@ const initializerMayRetainEntry = (
   binding: JavaScriptSemanticBindingState,
   parents: WeakMap<t.Node, t.Node>,
 ): boolean => {
-  const node = initializer.node,
-    parent = parents.get(node);
-  const assignment = t.isAssignmentExpression(node)
-    ? node
-    : t.isAssignmentExpression(parent) && parent.right === node
-      ? parent
-      : undefined;
+  const assignment = initializerAssignment(initializer, parents);
   if (
     assignment === undefined ||
     !["&&=", "||=", "??="].includes(assignment.operator)
   )
     return false;
   const emptyLocal =
-    node === assignment.right &&
+    initializer.node === assignment.right &&
     binding.kind === "variable" &&
     !binding.runtimeImport &&
     binding.initializers.length === 1 &&
@@ -822,7 +1323,8 @@ const initializerMayRetainEntry = (
   return !emptyLocal;
 };
 
-/** Certain writes replace prior origins; short-circuit writes retain both. */
+/** Certain writes replace prior origins; short-circuit writes retain both
+ * unless one covered entry is proven truthy at every intervening logical read. */
 const retainedInitializerOrigins = (
   origins: readonly {
     readonly initializer: JavaScriptSemanticBindingState["initializers"][number];
@@ -830,6 +1332,7 @@ const retainedInitializerOrigins = (
   }[],
   binding: JavaScriptSemanticBindingState,
   parents: WeakMap<t.Node, t.Node>,
+  initializerIsTruthy?: Parameters<typeof semanticBindingAtRead>[3],
 ) => {
   const latest = origins.reduce<StatementPosition | null>(
     (latest, { initializer, position }) =>
@@ -840,19 +1343,54 @@ const retainedInitializerOrigins = (
         : latest,
     null,
   );
+  const candidates = origins.filter(
+    ({ position }) =>
+      latest === null ||
+      (position?.index === latest.index &&
+        position?.declaratorIndex === latest.declaratorIndex) ||
+      (position !== null && positionPrecedes(latest, position)),
+  );
+  if (
+    initializerIsTruthy !== undefined &&
+    latest !== null &&
+    candidates.length > 1
+  ) {
+    const entries = candidates.filter(
+      ({ initializer }) =>
+        !initializerMayRetainEntry(initializer, binding, parents),
+    );
+    const entry = entries.length === 1 ? entries[0] : undefined;
+    const entryPosition = entry?.position;
+    if (
+      entry !== undefined &&
+      entryPosition !== undefined &&
+      entryPosition !== null &&
+      entryPosition.index >= 0 &&
+      candidates.every(({ initializer, position }) => {
+        if (initializer === entry.initializer) return true;
+        const write = initializerAssignment(initializer, parents);
+        return (
+          write !== undefined &&
+          (write.operator === "||=" || write.operator === "??=") &&
+          position !== null &&
+          (positionPrecedes(entryPosition, position) ||
+            semanticExpressionEvaluationOrder(
+              entry.initializer.node,
+              write.left,
+              parents,
+            ) === "before") &&
+          initializerIsTruthy(entry.initializer, write.left)
+        );
+      })
+    )
+      return {
+        replacesEntry: true,
+        retained: new Set([entry.initializer]),
+      };
+  }
   return {
     replacesEntry: latest !== null,
-    retained: new Set(
-      origins
-        .filter(
-          ({ position }) =>
-            latest === null ||
-            (position?.index === latest.index &&
-              position?.declaratorIndex === latest.declaratorIndex) ||
-            (position !== null && positionPrecedes(latest, position)),
-        )
-        .map(({ initializer }) => initializer),
-    ),
+    retained: new Set(candidates.map(({ initializer }) => initializer)),
   };
 };
 

@@ -1,14 +1,69 @@
 import * as t from "@babel/types";
 import { describe, expect, it } from "vitest";
 
+import { indexJavaScriptBindingsSteps } from "./javascriptSemanticAnalysis.js";
 import {
   semanticBindingAtRead,
   semanticMutationInitializers,
   semanticTopLevelEffectFollowsCapture,
 } from "./javascriptSemanticMutationInitializers.js";
-import type { JavaScriptSemanticBindingState } from "./javascriptSemanticState.js";
-import { traverseJavaScriptAst } from "./javascriptSemanticTraversal.js";
+import {
+  resolveSemanticBindingState,
+  type JavaScriptSemanticBindingState,
+} from "./javascriptSemanticState.js";
+import {
+  completeSemanticSteps,
+  traverseJavaScriptAst,
+} from "./javascriptSemanticTraversal.js";
 import { parseJavaScriptSource } from "./javascriptSourceParser.js";
+
+it.each(["||=", "??="])(
+  "requires a value proof to remove a skipped %s source",
+  (operator) => {
+    const parsed = parseJavaScriptSource(
+      `let callback=()=>{};callback ${operator} other;consume(callback);`,
+    );
+    if (parsed === null) throw new Error("Expected a callback fixture");
+    const state = completeSemanticSteps(
+      indexJavaScriptBindingsSteps(parsed.program),
+    );
+    const statement = parsed.program.body.at(-1);
+    const read =
+      t.isExpressionStatement(statement) &&
+      t.isCallExpression(statement.expression)
+        ? statement.expression.arguments[0]
+        : undefined;
+    if (!t.isIdentifier(read)) throw new Error("Expected the callback read");
+    const binding = resolveSemanticBindingState(state, read, read.name);
+    if (binding === undefined) throw new Error("Expected the callback binding");
+    const ordinary = semanticBindingAtRead(binding, read, state.parentsByNode);
+    expect(ordinary.binding.initializers).toHaveLength(2);
+    expect(
+      semanticBindingAtRead(binding, read, state.parentsByNode, () => false)
+        .binding,
+    ).toBe(ordinary.binding);
+    const proofReads: t.Node[] = [];
+    const proven = semanticBindingAtRead(
+      binding,
+      read,
+      state.parentsByNode,
+      (initializer, logicalRead) => {
+        proofReads.push(logicalRead);
+        return t.isFunction(initializer.node);
+      },
+    );
+    expect(proven.hasDefiniteInitializer).toBe(true);
+    expect(proven.binding.initializers).toHaveLength(1);
+    expect(
+      t.isArrowFunctionExpression(proven.binding.initializers[0]?.node),
+    ).toBe(true);
+    expect(proofReads).toHaveLength(1);
+    expect(
+      t.isAssignmentExpression(state.parentsByNode.get(proofReads[0]!)),
+    ).toBe(true);
+    expect(binding.initializers).toHaveLength(2);
+  },
+);
 
 it.each([
   ["public value", false, false],

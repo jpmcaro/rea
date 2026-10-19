@@ -643,8 +643,13 @@ it("propagates branch guards through object properties and function calls", () =
   }
 });
 
-it("completes a loaded module past a very large array without stack overflow", () => {
-  const parsed = parseJavaScriptSource(`(() => {
+it.each([
+  { name: "without classes", prefix: "" },
+  { name: "with an unrelated class", prefix: "class Unrelated{};" },
+])(
+  "completes a loaded module past a very large array without stack overflow $name",
+  ({ prefix }) => {
+    const parsed = parseJavaScriptSource(`${prefix}(() => {
     const modules = {
       4(module) {
         module.exports = { table: [0] };
@@ -656,44 +661,46 @@ it("completes a loaded module past a very large array without stack overflow", (
     function load(id) { const m = {exports:{}}; modules[id](m,m.exports,load); return m.exports; }
     load(8);
   })();`);
-  if (parsed === null) throw new Error("symbolic source fixture did not parse");
-  const arrays: t.ArrayExpression[] = [];
-  const bareReturns: t.ReturnStatement[] = [];
-  let inspectCall: t.CallExpression | undefined;
-  traverseJavaScriptAst(parsed.program, {
-    enter: (node) => {
-      if (t.isArrayExpression(node)) arrays.push(node);
-      if (t.isReturnStatement(node) && node.argument == null)
-        bareReturns.push(node);
-      if (
-        t.isCallExpression(node) &&
-        t.isIdentifier(node.callee, { name: "inspect" })
-      )
-        inspectCall = node;
-    },
-  });
-  for (const array of arrays)
-    array.elements = Array.from({ length: 1_000_000 }, () =>
-      t.numericLiteral(0),
-    );
-  const earliestReturn = bareReturns.toSorted(
-    (left, right) => (left.start ?? 0) - (right.start ?? 0),
-  )[0];
-  const inspected = inspectCall?.arguments[0];
-  if (earliestReturn === undefined || inspected === undefined)
-    throw new Error("symbolic source fixture is missing its probes");
+    if (parsed === null)
+      throw new Error("symbolic source fixture did not parse");
+    const arrays: t.ArrayExpression[] = [];
+    const bareReturns: t.ReturnStatement[] = [];
+    let inspectCall: t.CallExpression | undefined;
+    traverseJavaScriptAst(parsed.program, {
+      enter: (node) => {
+        if (t.isArrayExpression(node)) arrays.push(node);
+        if (t.isReturnStatement(node) && node.argument == null)
+          bareReturns.push(node);
+        if (
+          t.isCallExpression(node) &&
+          t.isIdentifier(node.callee, { name: "inspect" })
+        )
+          inspectCall = node;
+      },
+    });
+    for (const array of arrays)
+      array.elements = Array.from({ length: 1_000_000 }, () =>
+        t.numericLiteral(0),
+      );
+    const earliestReturn = bareReturns.toSorted(
+      (left, right) => (left.start ?? 0) - (right.start ?? 0),
+    )[0];
+    const inspected = inspectCall?.arguments[0];
+    if (earliestReturn === undefined || inspected === undefined)
+      throw new Error("symbolic source fixture is missing its probes");
 
-  const state = completeSemanticSteps(
-    indexJavaScriptBindingsSteps(parsed.program),
-  );
-  const resolver = new JavaScriptSymbolicBindings(state, parsed.program);
-  const namespace = symbolicVariants(resolver.evaluate(inspected)).find(
-    (variant) => variant.kind === "namespace",
-  );
-  if (namespace?.kind !== "namespace")
-    throw new Error("loaded module namespace missing");
-  expect(namespace.environment.completedAt).toBe(earliestReturn);
-});
+    const state = completeSemanticSteps(
+      indexJavaScriptBindingsSteps(parsed.program),
+    );
+    const resolver = new JavaScriptSymbolicBindings(state, parsed.program);
+    const namespace = symbolicVariants(resolver.evaluate(inspected)).find(
+      (variant) => variant.kind === "namespace",
+    );
+    if (namespace?.kind !== "namespace")
+      throw new Error("loaded module namespace missing");
+    expect(namespace.environment.completedAt).toBe(earliestReturn);
+  },
+);
 
 it("keeps async call objects truthy and unwraps only awaited results", () => {
   const values = inspectedValues(`async function flag(){return false;}

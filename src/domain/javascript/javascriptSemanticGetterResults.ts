@@ -5,6 +5,7 @@ import {
 } from "./javascriptAstValues.js";
 import { semanticCallableResultExpressions } from "./javascriptSemanticCallableResults.js";
 import { semanticBindingAtRead } from "./javascriptSemanticMutationInitializers.js";
+import { createSemanticSuperLookup } from "./javascriptSemanticReceiverOwners.js";
 import { semanticReferenceSourcesInactive } from "./javascriptSemanticReferenceSources.js";
 import {
   resolveSemanticBindingState,
@@ -78,12 +79,14 @@ class GetterResultWalker {
   readonly #pending: GetterWork[] = [];
   readonly #aliases = new Map<string, Set<string>>();
   readonly #scope: string | undefined;
+  readonly #superLookup: ReturnType<typeof createSemanticSuperLookup>;
 
   constructor(
     readonly job: GetterQueryJob,
     readonly query: SemanticGetterQuery,
     readonly resolvers: GetterResultResolvers,
   ) {
+    this.#superLookup = createSemanticSuperLookup(query.state);
     for (const { node } of semanticCallableResultExpressions(
       job.invocation.getter,
     ))
@@ -284,24 +287,20 @@ class GetterResultWalker {
     current: GetterWork,
     expression: t.MemberExpression | t.OptionalMemberExpression,
   ): boolean {
-    const { getter, owner, receiver = owner } = this.job.invocation;
-    if (
-      !t.isSuper(expression.object) ||
-      !t.isClass(owner) ||
-      owner.superClass == null
-    )
-      return false;
+    const { owner, receiver = owner } = this.job.invocation;
+    if (!t.isSuper(expression.object)) return false;
+    const lookup = this.#superLookup(expression.object);
+    if (lookup?.base === undefined || !t.isClass(lookup.home)) return false;
     const key = semanticStaticPropertyKey(
       expression.property,
       expression.computed,
     );
-    for (const base of this.resolvers.bases(owner.superClass))
+    for (const base of this.resolvers.bases(lookup.base))
       for (const reference of this.resolvers.classReferences(
         {
           owner: base,
-          receiver: t.isClass(receiver) ? receiver : owner,
-          kind:
-            t.isClassMethod(getter) && getter.static ? "static" : "prototype",
+          receiver: t.isClass(receiver) ? receiver : lookup.home,
+          kind: lookup.projection.length === 0 ? "static" : "prototype",
         },
         [key, ...current.path],
         current.escapes || this.job.escapes,

@@ -7,7 +7,15 @@ import {
   unwrapJavaScriptExpression,
 } from "./javascriptAstValues.js";
 import { javascriptBootstrapAt } from "./javascriptBootstrap.js";
+import {
+  semanticOpaqueBindingReadMayHaveChanged,
+  semanticGlobalBindingReadMayHaveChanged,
+} from "./javascriptSemanticOpaqueEffects.js";
 import { ELECTRON_MODULE } from "./javascriptElectronMemberWrites.js";
+import {
+  semanticHostRequireIntact,
+  semanticHostRequireModuleWritesIntact,
+} from "./javascriptSemanticRequireOrigin.js";
 import {
   indexJavaScriptElectronIdentitySteps,
   type JavaScriptElectronIdentity,
@@ -306,7 +314,11 @@ export class JavaScriptSymbolicBindings {
       const path = [...value.path, key];
       if (
         ELECTRON_MODULE.test(path[0] ?? "") &&
-        !this.#electronIdentity.intactExport(path)
+        !this.#electronIdentity.intactExport(
+          path,
+          read?.node,
+          value.path.length,
+        )
       ) {
         return symbolicUnknown("overwritten Electron API member");
       }
@@ -695,6 +707,12 @@ export class JavaScriptSymbolicBindings {
     const binding = resolveSemanticBindingState(this.state, node, node.name);
     if (
       !binding &&
+      node.name === "require" &&
+      !semanticHostRequireIntact(node, node, this.state)
+    )
+      return symbolicUnknown("host loader may have changed before capture");
+    if (
+      !binding &&
       node.name === "undefined" &&
       !semanticResolutionBlocked(this.state, node, node.name)
     )
@@ -704,6 +722,13 @@ export class JavaScriptSymbolicBindings {
         ["require", "navigator", "String", "Boolean"].includes(node.name)
         ? { kind: "external", path: [node.name] }
         : symbolicUnknown("unbound identifier");
+    if (
+      semanticOpaqueBindingReadMayHaveChanged(binding, node, this.state) ||
+      semanticGlobalBindingReadMayHaveChanged(binding, node, this.state)
+    )
+      return symbolicUnknown(
+        "eval or global writes may have changed this binding",
+      );
     if (binding.definitions.some((d) => d.kind === "assignment"))
       return symbolicUnknown("reassigned binding");
     // Electron member identity is checked at the selected property. A write
@@ -1112,7 +1137,9 @@ export class JavaScriptSymbolicBindings {
         ) {
           const spec = args[0];
           result =
-            spec?.kind === "literal" && typeof spec.value === "string"
+            semanticHostRequireModuleWritesIntact(node, this.state) &&
+            spec?.kind === "literal" &&
+            typeof spec.value === "string"
               ? { kind: "external", path: [spec.value] }
               : symbolicUnknown("dynamic require");
         } else if (

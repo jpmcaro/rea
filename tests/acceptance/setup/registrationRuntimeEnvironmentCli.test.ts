@@ -11,14 +11,6 @@ import {
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { cliTest } from "../../support/cli/cliFixture.js";
 
-// Registration configuration tests must not discover installed providers or
-// plan provider-environment edits based on the machine running the suite.
-const missingHopperAndGhidraEnvironment = (home: string) => ({
-  HOPPER_LAUNCHER_PATH: join(home, "missing-hopper"),
-  GHIDRA_INSTALL_DIR: join(home, "missing-ghidra"),
-  JAVA_HOME: join(home, "missing-java"),
-});
-
 const scenarios = [
   {
     client: "cursor",
@@ -83,7 +75,7 @@ cliTest.for([
       USERPROFILE: home,
       XDG_CONFIG_HOME: join(home, ".config"),
       DSH_HOME: join(home, ".dsh"),
-      ...missingHopperAndGhidraEnvironment(home),
+      HOPPER_LAUNCHER_PATH: join(home, "missing-hopper"),
     };
     const registration = (env: Readonly<Record<string, string>>) => {
       const entry = clientRegistrationEntry(
@@ -202,7 +194,6 @@ for (const scenario of scenarios)
         USERPROFILE: home,
         XDG_CONFIG_HOME: join(home, ".config"),
         DSH_HOME: join(home, ".dsh"),
-        ...missingHopperAndGhidraEnvironment(home),
       };
       const registration = (env: Readonly<Record<string, string>>) => {
         const server = {
@@ -333,7 +324,11 @@ cliTest(
       HOME: home,
       USERPROFILE: home,
       XDG_CONFIG_HOME: join(home, ".config"),
-      ...missingHopperAndGhidraEnvironment(home),
+      // Select absent provider locations so installed tools cannot make this
+      // configuration merge test plan an unrelated provider-environment edit.
+      HOPPER_LAUNCHER_PATH: join(home, "missing-hopper"),
+      GHIDRA_INSTALL_DIR: join(home, "missing-ghidra"),
+      JAVA_HOME: join(home, "missing-java"),
     };
     const run = (args: readonly string[]) =>
       cli.run({ arguments: [...args, "--json"], cwd: home, environment });
@@ -410,7 +405,7 @@ cliTest(
       XDG_CONFIG_HOME: join(home, ".config"),
       CODEX_HOME: codexHome,
       KIMI_CODE_HOME: kimiHome,
-      ...missingHopperAndGhidraEnvironment(home),
+      HOPPER_LAUNCHER_PATH: join(home, "missing-hopper"),
       REA_ANALYSIS_PROVIDER: "auto",
       REA_GHIDRA_STARTUP_TIMEOUT_MS: "2700001",
       REA_HOPPER_STARTUP_TIMEOUT_MS: "2800002",
@@ -508,7 +503,7 @@ for (const [client, provider] of [
         XDG_CONFIG_HOME: join(home, ".config"),
         CODEX_HOME: clientHome,
         KIMI_CODE_HOME: clientHome,
-        ...missingHopperAndGhidraEnvironment(home),
+        HOPPER_LAUNCHER_PATH: join(home, "missing-hopper"),
       };
       const setupArguments = [
         "setup",
@@ -633,7 +628,7 @@ for (const invalidSetting of [
         USERPROFILE: home,
         XDG_CONFIG_HOME: join(home, ".config"),
         KIMI_CODE_HOME: kimiHome,
-        ...missingHopperAndGhidraEnvironment(home),
+        HOPPER_LAUNCHER_PATH: join(home, "missing-hopper"),
         [invalidSetting.setting]: invalidSetting.value,
       };
       const result = await cli.run({

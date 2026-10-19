@@ -5,6 +5,7 @@ import { indexJavaScriptBindingsSteps } from "./javascriptSemanticAnalysis.js";
 import {
   semanticClassPropertyReferences,
   semanticObjectPropertyReferences,
+  semanticOwnReferenceCandidates,
 } from "./javascriptSemanticObjectReferences.js";
 import { completeSemanticSteps } from "./javascriptSemanticTraversal.js";
 import { parseJavaScriptSource } from "./javascriptSourceParser.js";
@@ -35,6 +36,31 @@ const spelled = (
       JSON.stringify(path),
     ],
   );
+
+it.each([
+  "get p() { return 42; }",
+  "get p() { return { child: {} }; }",
+  "set p(value) {}",
+])("keeps accessor value uncertainty separate from presence: %s", (member) => {
+  const fixture = objectAndState(`const o = { ${member} };`);
+  const query = (path: readonly string[], presenceOnly = false) =>
+    semanticOwnReferenceCandidates(
+      fixture.object,
+      path,
+      fixture.state,
+      { ownSlotUnchanged: () => true },
+      fixture.object,
+      presenceOnly,
+    );
+
+  expect(query(["p"])).toEqual({
+    complete: false,
+    nodes: [],
+    absent: false,
+  });
+  expect(query(["p"], true).complete).toBe(true);
+  expect(query(["p", "child"], true).complete).toBe(false);
+});
 
 it("resolves exact keys with source-order overrides, spreads and accessors", () => {
   const fixture = objectAndState(
