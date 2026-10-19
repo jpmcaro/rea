@@ -922,6 +922,13 @@ const projectPrimarySessionError = (
           ? failure
           : failure.cancellation.reason,
     });
+  if (failure.kind === "remote" && failure.remoteCode === "decompile_failed")
+    return new ProviderAdapterError("ghidra", operation, {
+      ...context,
+      userMessage: `${failure.message.trim().replace(/\.$/u, "")}. Only the decompiler failed for this procedure; the Ghidra session remains usable.`,
+      remediationAction:
+        "Call analyze_function (CLI: `rea function`) for the same procedure. It returns assembly, callers, callees, references and basic blocks from the Ghidra listing and records this decompiler failure under facet_availability.pseudocode. Repeating the unchanged decompile request is not expected to succeed.",
+    });
   if (failure.kind === "analysis_timeout")
     return new AnalysisTimeoutError(
       operation,

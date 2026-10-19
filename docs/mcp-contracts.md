@@ -59,7 +59,10 @@ Call comparison additionally retains the Evidence relationship coverage
 checks. Ghidra and Hopper declare their observed dossier facets and complete
 provider-observed caller/callee sets, including empty sets. Missing decompiler
 output remains unavailable; complete call coverage does not claim every runtime
-target. Hopper's unavailable reference-kind metadata and reported unresolved
+target. When Ghidra's decompiler fails on one function, its dossier is still
+returned: `pseudocode`, `native_api` and `native_value_flow` are unavailable
+with the decompiler's failure as the reason, while the listing-backed facets
+are collected as usual. `procedure_pseudo_code` still fails for that function. Hopper's unavailable reference-kind metadata and reported unresolved
 calls still prevent equality conclusions for those dimensions. Analysis profiles
 version these declarations so older snapshots are not reused as current results.
 IDA declares the facets its selected adapter cannot provide; an empty
