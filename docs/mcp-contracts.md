@@ -225,6 +225,12 @@ names are inferences; the Evidence is inferred whenever any tool or excluded gro
 is templated, and derived otherwise.
 See [environment manifests](web-network-captures.md#environment-manifest).
 
+`inspect_analysis_view` also reads completed `capture_browser_scenario`
+Evidence: a summary, step pages that compare each step's capture with the
+previous step's capture, and one step's retained accessibility or DOM text.
+Step changes are observed differences between consecutive captures, not action
+causation. See [step and text views](browser-scenario-contract.md#step-and-text-views).
+
 `inspect_analysis_view` projects a caller-selected view of already completed
 `inspect_binary_layout`, `analyze_javascript_application`, or `analyze_function`
 Evidence. Native views select procedure, pseudocode, assembly, basic blocks,
